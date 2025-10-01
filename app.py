@@ -1,537 +1,535 @@
-def extrair_partes(texto):
-    """Separa explicação de código"""
-    if '```python' in texto:
-        partes = texto.split('```python')
-        explicacao = partes[0].strip()
-        
-        if len(partes) > 1:
-            codigo = partes[1].split('```')[0].strip()
-            return explicacao, codigo
-    
-    return texto.strip(), None
-
+import streamlit as st
 import pandas as pd
-import requests
-import time
-import matplotlib.pyplot as plt
-import numpy as np
-import os
+import ollama
+import tools
+import inspect
 import json
-import re
 from datetime import datetime
 
-print("="*70)
-print("🤖 AGENTE DE ANÁLISE EXPLORATÓRIA DE DADOS (EDA)")
-print("="*70)
+# --- Configuração da Página ---
+st.set_page_config(page_title="Sistema Multiagente - EDA Genérico", page_icon="🔍", layout="wide")
 
-# Leitura interativa do CSV
-caminho_csv = input("\n📂 Digite o caminho completo do CSV: ")
-if not os.path.isfile(caminho_csv):
-    print("❌ Arquivo não encontrado. Verifique o caminho e tente novamente.")
-    exit()
+# --- Estado da Sessão ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "analises_realizadas" not in st.session_state:
+    st.session_state.analises_realizadas = []
+if "insights_descobertos" not in st.session_state:
+    st.session_state.insights_descobertos = []
+if "pensamento_agentes" not in st.session_state:
+    st.session_state.pensamento_agentes = []
 
-print("\n⏳ Carregando dados...")
-df = pd.read_csv(caminho_csv)
-
-print("\n✅ Dados carregados com sucesso!")
-print(f"📏 Dimensões: {df.shape[0]} linhas × {df.shape[1]} colunas")
-print(f"📋 Colunas: {', '.join(df.columns.tolist())}")
-print("\n📊 Prévia dos primeiros registros:")
-print(df.head())
-
-# Memória do agente - armazena análises realizadas
-memoria_agente = {
-    "analises_realizadas": [],
-    "insights_descobertos": [],
-    "dados_estatisticos": {},
-    "inicio_sessao": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# --- Ferramentas Expandidas ---
+caixa_de_ferramentas = {
+    "mostrar_tipos_de_dados": tools.mostrar_tipos_de_dados,
+    "mostrar_estatisticas_descritivas": tools.mostrar_estatisticas_descritivas,
+    "gerar_histograma": tools.gerar_histograma,
+    "gerar_mapa_de_calor_correlacao": tools.gerar_mapa_de_calor_correlacao,
+    "gerar_boxplot": tools.gerar_boxplot,
+    "encontrar_outliers_zscore": tools.encontrar_outliers_zscore,
 }
 
-def salvar_na_memoria(tipo, conteudo):
-    """Salva informações importantes na memória do agente"""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    
-    if tipo == "analise":
-        memoria_agente["analises_realizadas"].append({
-            "timestamp": timestamp,
-            "descricao": conteudo
-        })
-    elif tipo == "insight":
-        memoria_agente["insights_descobertos"].append({
-            "timestamp": timestamp,
-            "insight": conteudo
-        })
-    elif tipo == "estatistica":
-        memoria_agente["dados_estatisticos"].update(conteudo)
-
-def gerar_contexto_memoria():
-    """Gera um resumo da memória para incluir no prompt"""
-    if not memoria_agente["analises_realizadas"]:
-        return ""
-    
-    resumo = "\n--- MEMÓRIA DO AGENTE (Análises Anteriores) ---\n"
-    
-    # Últimas 3 análises
-    for analise in memoria_agente["analises_realizadas"][-3:]:
-        resumo += f"[{analise['timestamp']}] {analise['descricao']}\n"
-    
-    # Insights descobertos
-    if memoria_agente["insights_descobertos"]:
-        resumo += "\nInsights importantes descobertos:\n"
-        for insight in memoria_agente["insights_descobertos"][-3:]:
-            resumo += f"• {insight['insight']}\n"
-    
-    return resumo
-
-def limpar_codigo(codigo):
-    """Remove caracteres problemáticos e corrige erros comuns"""
-    # Remove caracteres unicode malformados
-    codigo = re.sub(r'\\u[0-9a-fA-F]{4}', '', codigo)
-    codigo = re.sub(r'\\x[0-9a-fA-F]{2}', '', codigo)
-    
-    # Corrige erros comuns
-    codigo = codigo.replace("plt0.", "plt.")
-    codigo = codigo.replace("df0.", "df.")
-    
-    # Remove linhas problemáticas
-    linhas = codigo.split('\n')
-    linhas_filtradas = []
-    
-    for linha in linhas:
-        # Remove imports de bibliotecas não disponíveis
-        if 'import' in linha.lower():
-            if any(lib in linha for lib in ['seaborn', 'scipy', 'sklearn', 'sns', 'plotly', 'sns as']):
-                continue
-        
-        # Remove tentativas de recriar DataFrame
-        if 'pd.read_csv' in linha or 'StringIO' in linha or 'io.StringIO' in linha:
-            continue
-        
-        # Remove chamadas de funções inexistentes
-        if 'spearman_kendall' in linha or '.spearmanr(' in linha:
-            continue
-            
-        linhas_filtradas.append(linha)
-    
-    codigo = '\n'.join(linhas_filtradas)
-    
-    # Adiciona plt.show() se necessário
-    if 'plt.' in codigo and 'plt.show()' not in codigo:
-        codigo += '\nplt.show()'
-    
-    return codigo
-
-def gerar_codigo_fallback(pergunta, df):
-    """Gera código automaticamente quando o LLM falha"""
+# --- Função para classificar perguntas ---
+def classificar_pergunta(pergunta):
+    """Classifica o tipo de pergunta para melhor roteamento"""
     pergunta_lower = pergunta.lower()
     
-    # Histograma
-    if any(palavra in pergunta_lower for palavra in ['histograma', 'distribuição', 'distribuicao']):
-        # Encontra coluna mencionada
-        colunas = [col for col in df.columns if col.lower() in pergunta_lower]
-        if colunas:
-            col = colunas[0]
-            return f"""plt.figure(figsize=(10, 6))
-plt.hist(df['{col}'], bins=50, color='steelblue', edgecolor='black', alpha=0.7)
-plt.title('Distribuição de {col}')
-plt.xlabel('{col}')
-plt.ylabel('Frequência')
-plt.grid(True, alpha=0.3)
-plt.show()"""
+    # Ordem importa! Verificar conclusões PRIMEIRO
+    if any(word in pergunta_lower for word in ["conclusão", "conclusao", "conclusões", "conclusoes", "insight", "o que você", "o que voce", "descobri", "aprende"]):
+        return "conclusoes"
+    elif any(word in pergunta_lower for word in ["compar", "boxplot", "versus", "vs", " por ", " x ", "diferença", "diferenca"]):
+        return "comparacao"
+    elif any(word in pergunta_lower for word in ["outlier", "atípico", "atipico", "anomal", "discrepan", "valores extremos"]):
+        return "outliers"
+    elif any(word in pergunta_lower for word in ["correlação", "correlacao", "relacao", "relaciona", "mapa de calor"]):
+        return "correlacao"
+    elif any(word in pergunta_lower for word in ["distribui", "histograma", "frequen"]):
+        return "distribuicao"
+    elif any(word in pergunta_lower for word in ["tipo", "tipos", "categori", "numeri"]):
+        return "tipos_dados"
+    elif any(word in pergunta_lower for word in ["estatística", "estatistica", "média", "media", "mediana", "desvio", "resumo"]):
+        return "estatisticas"
+    else:
+        return "geral"
+
+# --- Função para obter informações detalhadas do DataFrame ---
+def obter_info_completa_dataframe(df):
+    """Retorna informações completas sobre o DataFrame"""
+    colunas_numericas = list(df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns)
+    colunas_categoricas = list(df.select_dtypes(include=['object', 'category', 'bool']).columns)
     
-    # Scatter plot / Dispersão
-    if any(palavra in pergunta_lower for palavra in ['dispersão', 'dispersao', 'scatter', 'relação', 'relacao']):
-        colunas = [col for col in df.columns if col.lower() in pergunta_lower]
-        if len(colunas) >= 2:
-            return f"""plt.figure(figsize=(10, 6))
-plt.scatter(df['{colunas[0]}'], df['{colunas[1]}'], alpha=0.5, c='steelblue')
-plt.title('Dispersão: {colunas[0]} vs {colunas[1]}')
-plt.xlabel('{colunas[0]}')
-plt.ylabel('{colunas[1]}')
-plt.grid(True, alpha=0.3)
-plt.show()"""
-    
-    # Correlação
-    if 'correlação' in pergunta_lower or 'correlacao' in pergunta_lower:
-        colunas = [col for col in df.columns if col.lower() in pergunta_lower]
-        if len(colunas) >= 2:
-            return f"""correlacao = df[['{colunas[0]}', '{colunas[1]}']].corr()
-print("\\nMatriz de Correlação:")
-print(correlacao)
-print(f"\\nCorrelação entre {colunas[0]} e {colunas[1]}: {{correlacao.iloc[0,1]:.4f}}")"""
-        elif len(colunas) == 0:
-            return """correlacao = df.select_dtypes(include=[np.number]).corr()
-print("\\nMatriz de Correlação:")
-print(correlacao)"""
-    
-    # Estatísticas
-    if any(palavra in pergunta_lower for palavra in ['estatística', 'estatistica', 'describe', 'resumo']):
-        colunas = [col for col in df.columns if col.lower() in pergunta_lower]
-        if colunas:
-            return f"""print(df['{colunas[0]}'].describe())"""
-        else:
-            return "print(df.describe())"
-    
-    # Boxplot
-    if 'boxplot' in pergunta_lower or 'outlier' in pergunta_lower:
-        colunas = [col for col in df.columns if col.lower() in pergunta_lower]
-        if colunas:
-            col = colunas[0]
-            return f"""plt.figure(figsize=(10, 6))
-plt.boxplot(df['{col}'].dropna())
-plt.title('Boxplot de {col}')
-plt.ylabel('{col}')
-plt.grid(True, alpha=0.3)
-plt.show()"""
-    
-    return None
+    info = {
+        "colunas": list(df.columns),
+        "tipos": df.dtypes.astype(str).to_dict(),
+        "colunas_numericas": colunas_numericas,
+        "colunas_categoricas": colunas_categoricas,
+        "shape": df.shape,
+        "memoria_mb": round(df.memory_usage(deep=True).sum() / (1024*1024), 2),
+        "valores_nulos": df.isnull().sum().to_dict(),
+        "primeiras_linhas": df.head(3).to_dict('records') if len(df) > 0 else []
+    }
+    return info
 
-def extrair_partes(texto):
-    """Separa explicação de código"""
-    if '```python' in texto:
-        partes = texto.split('```python')
-        explicacao = partes[0].strip()
-        
-        if len(partes) > 1:
-            codigo = partes[1].split('```')[0].strip()
-            return explicacao, codigo
-    
-    return texto.strip(), None
-
-def eh_pergunta_sobre_conclusoes(pergunta):
-    """Verifica se é pergunta sobre conclusões/insights do agente"""
-    palavras_chave = [
-        'conclus', 'insight', 'aprend', 'descobr', 'observ',
-        'padrão', 'tendência', 'opinião', 'análise geral',
-        'resumo', 'principais', 'importante', 'destaque'
-    ]
-    pergunta_lower = pergunta.lower()
-    return any(palavra in pergunta_lower for palavra in palavras_chave)
-
-def analisar_ambiguidade(pergunta, colunas_df):
-    """Verifica se a pergunta é ambígua e sugere esclarecimentos"""
-    pergunta_lower = pergunta.lower()
-    
-    # Perguntas sobre TODAS as colunas ou análise geral são VÁLIDAS
-    perguntas_gerais_validas = [
-        'tipos de dados', 'tipos de coluna', 'tipo das coluna',
-        'quais coluna', 'quantas coluna', 'estrutura',
-        'numéricas', 'categóricas', 'dtypes', 'info',
-        'todas as coluna', 'todas coluna', 'cada coluna',
-        'variância', 'variacao', 'desvio padrão',
-        'estatísticas', 'estatistica', 'describe',
-        'valores nulos', 'missing', 'correlação geral',
-        'matriz de correlação', 'correlacao geral'
-    ]
-    
-    if any(termo in pergunta_lower for termo in perguntas_gerais_validas):
-        return {"ambigua": False}
-    
-    # Se menciona "todas", "cada", "geral" - permite
-    if any(palavra in pergunta_lower for palavra in ['todas', 'todos', 'cada', 'geral', 'comparar']):
-        return {"ambigua": False}
-    
-    # Detecta perguntas REALMENTE muito vagas (menos de 3 palavras e sem contexto)
-    perguntas_vagas = ['analise', 'mostre', 'me fale']
-    if any(vaga in pergunta_lower for vaga in perguntas_vagas) and len(pergunta.split()) <= 2:
-        return {
-            "ambigua": True,
-            "motivo": "muito_vaga",
-            "sugestoes": [
-                "Qual aspecto específico você quer analisar?",
-                "Você quer ver: distribuição, correlação, outliers ou estatísticas?"
-            ]
-        }
-    
-    # Detecta menção a "uma coluna" ou "a coluna" sem especificar qual
-    if (('uma coluna' in pergunta_lower or 'a coluna' in pergunta_lower or 'essa coluna' in pergunta_lower) 
-        and not any(col.lower() in pergunta_lower for col in colunas_df)):
-        return {
-            "ambigua": True,
-            "motivo": "coluna_nao_especificada",
-            "sugestoes": [
-                f"Colunas disponíveis: {', '.join(colunas_df[:10])}",
-                "Qual coluna específica você quer analisar?"
-            ]
-        }
-    
-    # Detecta "correlação" entre duas colunas específicas incompleta
-    if 'correlação entre' in pergunta_lower or 'correlacao entre' in pergunta_lower:
-        colunas_mencionadas = [col for col in colunas_df if col.lower() in pergunta_lower]
-        if len(colunas_mencionadas) == 1:
-            colunas_numericas = df.select_dtypes(include=[np.number]).columns.tolist()
-            return {
-                "ambigua": True,
-                "motivo": "correlacao_incompleta",
-                "sugestoes": [
-                    f"Correlação de '{colunas_mencionadas[0]}' com qual outra coluna?",
-                    f"Colunas numéricas disponíveis: {', '.join(colunas_numericas[:8])}"
-                ]
-            }
-    
-    # Detecta "faça um gráfico" sem mais informações
-    if ('faça um gráfico' in pergunta_lower or 'faca um grafico' in pergunta_lower) and len(pergunta.split()) <= 4:
-        return {
-            "ambigua": True,
-            "motivo": "grafico_incompleto",
-            "sugestoes": [
-                "Que tipo de gráfico e de qual coluna?",
-                "Ex: 'Faça um histograma de Amount' ou 'Gráfico de dispersão entre Time e Amount'"
-            ]
-        }
-    
-    return {"ambigua": False}
-
-# Análise inicial automática dos dados
-print("\n🔍 Realizando análise inicial dos dados...\n")
-analise_inicial = {
-    "tipos_colunas": df.dtypes.to_dict(),
-    "valores_nulos": df.isnull().sum().to_dict(),
-    "linhas_totais": len(df),
-    "colunas_numericas": df.select_dtypes(include=[np.number]).columns.tolist(),
-    "colunas_categoricas": df.select_dtypes(include=['object']).columns.tolist()
-}
-salvar_na_memoria("estatistica", analise_inicial)
-print("✅ Análise inicial concluída e armazenada na memória.\n")
-
-# Loop de perguntas
-print("="*70)
-print("💬 Você pode fazer perguntas sobre os dados.")
-print("💡 Exemplos:")
-print("   - Qual a distribuição da variável Amount?")
-print("   - Existe correlação entre Time e Amount?")
-print("   - Quais são suas conclusões sobre os dados até agora?")
-print("   - Existem outliers em Amount?")
-print("="*70)
-
-while True:
-    pergunta = input("\n🗣️  Sua pergunta (ou 'sair'): ")
-    
-    if pergunta.lower() in ['sair', 'exit', 'quit']:
-        print("\n" + "="*70)
-        print("📊 RESUMO DA SESSÃO")
-        print("="*70)
-        print(f"Total de análises realizadas: {len(memoria_agente['analises_realizadas'])}")
-        print(f"Total de insights descobertos: {len(memoria_agente['insights_descobertos'])}")
-        print("\n👋 Encerrando. Até logo!")
-        break
-    
-    if not pergunta.strip():
-        continue
-    
-    # NOVO: Verifica ambiguidade antes de processar
-    analise_ambig = analisar_ambiguidade(pergunta, df.columns.tolist())
-    
-    if analise_ambig["ambigua"]:
-        print("\n🤔 " + "="*68)
-        print("Hmm, preciso de mais informações para responder bem!")
-        print("="*68)
-        
-        for sugestao in analise_ambig["sugestoes"]:
-            print(f"\n💡 {sugestao}")
-        
-        print("\n" + "="*68)
-        print("Por favor, reformule sua pergunta com mais detalhes.")
-        print("="*68)
-        continue
-    
-    # Se for pergunta sobre conclusões, responde da memória
-    if eh_pergunta_sobre_conclusoes(pergunta):
-        print("\n🧠 Consultando memória do agente...\n")
-        print("="*70)
-        print("💭 CONCLUSÕES E INSIGHTS DO AGENTE")
-        print("="*70)
-        
-        if memoria_agente["analises_realizadas"]:
-            print(f"\n📈 Análises realizadas: {len(memoria_agente['analises_realizadas'])}")
-            print("\n🔍 Principais descobertas:")
-            
-            for i, insight in enumerate(memoria_agente["insights_descobertos"], 1):
-                print(f"\n{i}. {insight['insight']}")
-            
-            if not memoria_agente["insights_descobertos"]:
-                print("\n⚠️  Ainda não registrei insights específicos.")
-                print("Continue fazendo análises para que eu possa formar conclusões!")
-        else:
-            print("\n⚠️  Ainda não realizei análises suficientes para ter conclusões.")
-            print("Faça perguntas sobre os dados para que eu possa analisá-los!")
-        
-        print("\n" + "="*70)
-        continue
-    
-    # Gerar contexto com memória
-    contexto_dados = df.head(5).to_string()
-    contexto_memoria = gerar_contexto_memoria()
-    
-    # Prompt otimizado com memória e instruções para conclusões
-    prompt = f"""Você é um agente de análise de dados inteligente e reflexivo.
-
-DADOS DISPONÍVEIS:
-- DataFrame 'df' JÁ CARREGADO na memória
-- Total de linhas: {len(df)}
-- Colunas: {', '.join(df.columns.tolist())}
-- Tipos: {len(analise_inicial['colunas_numericas'])} numéricas, {len(analise_inicial['colunas_categoricas'])} categóricas
-
-PRÉVIA DOS DADOS:
-{contexto_dados}
-
-{contexto_memoria}
-
-BIBLIOTECAS DISPONÍVEIS:
-✅ pandas (pd), numpy (np), matplotlib.pyplot (plt)
-❌ NÃO use: seaborn, scipy, sklearn, plotly
-
-INSTRUÇÕES CRÍTICAS:
-1. Você DEVE SEMPRE gerar código Python executável
-2. TODO código deve estar entre ```python e ``` - SEM EXCEÇÕES!
-3. NÃO escreva apenas explicações - SEMPRE inclua código funcional
-4. Seja DIRETO: 2-3 linhas de explicação + código completo
-
-FORMATO OBRIGATÓRIO:
-Explicação breve (2-3 linhas)
-
-```python
-# Código completo aqui
-plt.figure(figsize=(10, 6))
-plt.hist(df['Amount'], bins=50)
-plt.title('Título')
-plt.show()
-```
-
-Conclusão (1 linha)
-
-EXEMPLOS COMPLETOS:
-
-Histograma:
-```python
-plt.figure(figsize=(10, 6))
-plt.hist(df['Amount'], bins=50, color='steelblue', edgecolor='black')
-plt.title('Distribuição de Amount')
-plt.xlabel('Valor')
-plt.ylabel('Frequência')
-plt.grid(True, alpha=0.3)
-```
-
-Scatter:
-```python
-plt.figure(figsize=(10, 6))
-plt.scatter(df['Time'], df['Amount'], alpha=0.5)
-plt.title('Time vs Amount')
-plt.xlabel('Time')
-plt.ylabel('Amount')
-plt.grid(True, alpha=0.3)
-```
-
-Correlação:
-```python
-corr = df[['Time', 'Amount']].corr()
-print(corr)
-```
-
-IMPORTANTE: Se a pergunta pede gráfico/análise, você DEVE gerar código entre ```python ```!
-
-EXEMPLOS DE CÓDIGO CORRETO:
-- Correlação: df[['col1', 'col2']].corr()
-- Dispersão: plt.scatter(df['x'], df['y'])
-- Histograma: plt.hist(df['col'], bins=30)
-- Estatísticas: df['col'].describe()
-
-PERGUNTA DO USUÁRIO: {pergunta}
-
-Sua resposta (explicação + código se necessário + conclusão):"""
-
-    print("\n🤖 Analisando...\n")
+# --- Função para extrair insights de resultados ---
+def extrair_insights_do_resultado(ferramenta, df, parametros):
+    """Extrai insights automáticos baseados na ferramenta executada"""
+    insights = []
     
     try:
-        resposta = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "phi3",
-                "prompt": prompt,
-                "stream": True,
-                "options": {
-                    "temperature": 0.6,
-                    "num_predict": 700,
-                    "top_p": 0.9,
-                }
-            },
-            stream=True,
-            timeout=120
-        )
-        
-        saida = ""
-        for linha in resposta.iter_lines():
-            if linha:
-                try:
-                    dados = json.loads(linha.decode("utf-8"))
-                    if "response" in dados:
-                        saida += dados["response"]
-                        if len(saida) > 5000:
-                            break
-                except json.JSONDecodeError:
-                    continue
-        
-        if not saida.strip():
-            print("⚠️  Resposta vazia. Tente reformular.")
-            continue
-        
-        # Extrair explicação e código
-        explicacao, codigo = extrair_partes(saida)
-        
-        # Mostra explicação
-        if explicacao:
-            print("💬 " + "="*68)
-            print(explicacao)
-            print("="*68 + "\n")
+        if ferramenta == "mostrar_tipos_de_dados":
+            num_colunas = len(df.columns)
+            num_numericas = len(df.select_dtypes(include=['number']).columns)
+            insights.append(f"Dataset possui {num_colunas} colunas, sendo {num_numericas} numéricas")
             
-            # Salvar na memória
-            salvar_na_memoria("analise", pergunta[:80])
-        
-        # Se não gerou código mas pergunta precisa, usa fallback
-        if not codigo:
-            print("⚙️  Gerando código automaticamente...\n")
-            codigo = gerar_codigo_fallback(pergunta, df)
-            
-            if codigo:
-                print("💡 O modelo não gerou código, usando solução automática.\n")
-        
-        # Executar código se houver
-        if codigo:
-            codigo_limpo = limpar_codigo(codigo)
-            
-            if codigo_limpo.strip():
-                print("🔧 Executando código...\n")
+        elif ferramenta == "mostrar_estatisticas_descritivas":
+            numeric_df = df.select_dtypes(include=['number'])
+            for col in numeric_df.columns:
+                media = numeric_df[col].mean()
+                mediana = numeric_df[col].median()
+                if abs(media - mediana) / (abs(media) + 0.0001) > 0.2:
+                    insights.append(f"{col}: Diferença significativa entre média ({media:.2f}) e mediana ({mediana:.2f}), indica distribuição assimétrica")
+                    
+        elif ferramenta == "gerar_histograma":
+            if "coluna" in parametros:
+                col = parametros["coluna"]
+                if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+                    skew = df[col].skew()
+                    if abs(skew) > 1:
+                        insights.append(f"{col}: Distribuição altamente assimétrica (skewness={skew:.2f})")
+                    media = df[col].mean()
+                    mediana = df[col].median()
+                    insights.append(f"{col}: Média={media:.2f}, Mediana={mediana:.2f}")
+                    
+        elif ferramenta == "gerar_mapa_de_calor_correlacao":
+            numeric_df = df.select_dtypes(include=['number'])
+            corr = numeric_df.corr()
+            correlacoes_fortes = []
+            for i in range(len(corr.columns)):
+                for j in range(i+1, len(corr.columns)):
+                    if abs(corr.iloc[i, j]) > 0.7:
+                        correlacoes_fortes.append(f"{corr.columns[i]} e {corr.columns[j]} ({corr.iloc[i, j]:.2f})")
+            if correlacoes_fortes:
+                insights.append(f"Correlações fortes detectadas: {', '.join(correlacoes_fortes[:3])}")
+            else:
+                insights.append("Não foram detectadas correlações fortes (>0.7) entre as variáveis")
+                        
+        elif ferramenta == "encontrar_outliers_zscore":
+            from scipy import stats
+            import numpy as np
+            numeric_df = df.select_dtypes(include=['number'])
+            z_scores = np.abs(stats.zscore(numeric_df.fillna(0)))
+            outliers = (z_scores > 3).sum()
+            total_outliers = outliers.sum()
+            if total_outliers > 0:
+                colunas_com_outliers = outliers[outliers > 0]
+                for col in colunas_com_outliers.index[:3]:
+                    insights.append(f"{col}: {colunas_com_outliers[col]} outliers ({colunas_com_outliers[col]/len(df)*100:.1f}%)")
+            else:
+                insights.append("Nenhum outlier significativo detectado (Z-score > 3)")
                 
+        elif ferramenta == "gerar_boxplot":
+            if "coluna_x" in parametros and "coluna_y" in parametros:
+                col_x = parametros["coluna_x"]
+                col_y = parametros["coluna_y"]
+                if col_x in df.columns and col_y in df.columns:
+                    grupos = df.groupby(col_x)[col_y].agg(['mean', 'count'])
+                    maior_media = grupos['mean'].idxmax()
+                    insights.append(f"Grupo '{maior_media}' apresenta maior média em {col_y} ({grupos.loc[maior_media, 'mean']:.2f})")
+                
+    except Exception as e:
+        st.session_state.pensamento_agentes.append(f"Erro ao extrair insights: {e}")
+    
+    return insights
+
+# --- Agente Decisor de Gráficos ---
+def agente_deve_gerar_grafico(pergunta_usuario, ferramenta_escolhida):
+    """Decide se deve gerar gráfico baseado no contexto"""
+    
+    # Sempre gerar gráfico para estas ferramentas
+    ferramentas_graficas = ["gerar_histograma", "gerar_mapa_de_calor_correlacao", "gerar_boxplot"]
+    
+    if ferramenta_escolhida in ferramentas_graficas:
+        return True
+    
+    # Verificar se usuário pediu explicitamente
+    palavras_grafico = ["gráfico", "grafico", "visualiza", "plota", "mostra", "desenha"]
+    if any(palavra in pergunta_usuario.lower() for palavra in palavras_grafico):
+        return True
+    
+    # Para perguntas sobre distribuição, correlação, comparação
+    palavras_visual = ["distribui", "correlação", "correlacao", "compara", "relação", "relacao"]
+    if any(palavra in pergunta_usuario.lower() for palavra in palavras_visual):
+        return True
+        
+    return False
+
+# --- Agente Roteador Inteligente ---
+def agente_roteador_inteligente(pergunta_usuario, ferramentas, info_df, tipo_pergunta):
+    """Roteador baseado na classificação da pergunta"""
+    
+    st.session_state.pensamento_agentes.append(f"Tipo de pergunta identificado: {tipo_pergunta}")
+    
+    # Mapeamento direto baseado no tipo
+    mapeamento = {
+        "tipos_dados": "mostrar_tipos_de_dados",
+        "estatisticas": "mostrar_estatisticas_descritivas", 
+        "distribuicao": "gerar_histograma",
+        "correlacao": "gerar_mapa_de_calor_correlacao",
+        "outliers": "encontrar_outliers_zscore",
+        "comparacao": "gerar_boxplot",
+        "geral": "mostrar_estatisticas_descritivas"
+    }
+    
+    ferramenta_escolhida = mapeamento.get(tipo_pergunta, "mostrar_estatisticas_descritivas")
+    st.session_state.pensamento_agentes.append(f"Ferramenta selecionada: {ferramenta_escolhida}")
+    
+    return ferramenta_escolhida
+
+# --- Agente Extrator Melhorado ---
+def agente_extrator_parametros_melhorado(pergunta_usuario, ferramenta, info_df):
+    """Extrator de parâmetros mais inteligente"""
+    
+    funcao = caixa_de_ferramentas[ferramenta]
+    assinatura = inspect.signature(funcao)
+    parametros_funcao = [p for p in assinatura.parameters.keys() if p != 'df']
+    
+    if not parametros_funcao:
+        st.session_state.pensamento_agentes.append("Função não precisa de parâmetros adicionais")
+        return {}
+    
+    st.session_state.pensamento_agentes.append(f"Buscando parâmetros: {parametros_funcao}")
+    
+    params_extraidos = {}
+    pergunta_lower = pergunta_usuario.lower()
+    
+    # Para histogramas - buscar nome da coluna
+    if "coluna" in parametros_funcao:
+        for col in info_df['colunas']:
+            if col.lower() in pergunta_lower:
+                params_extraidos["coluna"] = col
+                break
+        
+        # Se não encontrou, usa a primeira numérica
+        if "coluna" not in params_extraidos and info_df['colunas_numericas']:
+            params_extraidos["coluna"] = info_df['colunas_numericas'][0]
+            st.session_state.pensamento_agentes.append(f"Coluna não especificada, usando: {params_extraidos['coluna']}")
+    
+    # Para boxplots - buscar duas colunas
+    if "coluna_x" in parametros_funcao and "coluna_y" in parametros_funcao:
+        colunas_mencionadas = []
+        for col in info_df['colunas']:
+            if col.lower() in pergunta_lower:
+                colunas_mencionadas.append(col)
+        
+        if len(colunas_mencionadas) >= 2:
+            params_extraidos["coluna_x"] = colunas_mencionadas[0]
+            params_extraidos["coluna_y"] = colunas_mencionadas[1]
+        else:
+            # Usa defaults: primeira categórica e primeira numérica
+            if info_df['colunas_categoricas'] and info_df['colunas_numericas']:
+                params_extraidos["coluna_x"] = info_df['colunas_categoricas'][0]
+                params_extraidos["coluna_y"] = info_df['colunas_numericas'][0]
+                st.session_state.pensamento_agentes.append(f"Colunas não especificadas, usando: {params_extraidos['coluna_x']} vs {params_extraidos['coluna_y']}")
+    
+    st.session_state.pensamento_agentes.append(f"Parâmetros extraídos: {params_extraidos}")
+    return params_extraidos
+
+# --- Agente de Conclusões COMPLETO ---
+def agente_conclusoes_completo(df, analises_realizadas, insights_descobertos):
+    """Gera conclusões abrangentes sobre TODO o dataset analisado"""
+    
+    if not analises_realizadas and not insights_descobertos:
+        return "Ainda não realizei análises suficientes. Por favor, faça algumas perguntas sobre os dados primeiro para que eu possa gerar conclusões."
+    
+    # Coletar informações do dataset
+    info_df = obter_info_completa_dataframe(df)
+    numeric_df = df.select_dtypes(include=['number'])
+    
+    # Preparar contexto rico para o LLM
+    contexto_dataset = f"""
+INFORMAÇÕES DO DATASET:
+- Total de registros: {info_df['shape'][0]:,}
+- Total de colunas: {info_df['shape'][1]}
+- Colunas numéricas ({len(info_df['colunas_numericas'])}): {', '.join(info_df['colunas_numericas'][:5])}{'...' if len(info_df['colunas_numericas']) > 5 else ''}
+- Colunas categóricas ({len(info_df['colunas_categoricas'])}): {', '.join(info_df['colunas_categoricas'][:5])}{'...' if len(info_df['colunas_categoricas']) > 5 else ''}
+"""
+
+    # Estatísticas básicas selecionadas
+    estatisticas_basicas = ""
+    if not numeric_df.empty:
+        # Pegar apenas colunas mais relevantes
+        colunas_relevantes = numeric_df.columns[:3]  # Primeiras 3
+        for col in colunas_relevantes:
+            estatisticas_basicas += f"\n- {col}: média={numeric_df[col].mean():.2f}, mediana={numeric_df[col].median():.2f}, min={numeric_df[col].min():.2f}, max={numeric_df[col].max():.2f}"
+
+    # Resumir análises realizadas
+    tipos_analises = list(set([analise['tipo'] for analise in analises_realizadas[-15:]]))
+    resumo_analises = f"Realizadas {len(analises_realizadas)} análises: {', '.join(tipos_analises)}"
+    
+    # Top insights
+    top_insights = insights_descobertos[-10:] if len(insights_descobertos) > 10 else insights_descobertos
+    resumo_insights = "\n".join([f"- {insight}" for insight in top_insights])
+    
+    prompt = f"""Você é um cientista de dados. Forneça conclusões OBJETIVAS e DIRETAS sobre o dataset.
+
+{contexto_dataset}
+
+AMOSTRA DE ESTATÍSTICAS:
+{estatisticas_basicas}
+
+ANÁLISES: {resumo_analises}
+
+PRINCIPAIS DESCOBERTAS:
+{resumo_insights if resumo_insights else '- Análises estatísticas básicas realizadas'}
+
+INSTRUÇÕES CRÍTICAS:
+1. NÃO repita as estatísticas já mostradas
+2. NÃO gere novas tabelas ou análises
+3. SINTETIZE os padrões encontrados
+4. Seja DIRETO e OBJETIVO
+
+Forneça suas conclusões em 4 seções curtas:
+
+**1. CARACTERÍSTICAS DO DATASET** (2-3 linhas sobre tamanho, estrutura, qualidade)
+
+**2. PADRÕES IDENTIFICADOS** (2-3 principais descobertas dos insights)
+
+**3. QUALIDADE DOS DADOS** (valores nulos, outliers, problemas encontrados)
+
+**4. RECOMENDAÇÕES** (2 sugestões práticas para análises futuras)
+
+Responda em português do Brasil. Seja conciso."""
+
+    try:
+        st.session_state.pensamento_agentes.append("Conectando ao LLM local (phi3:mini)...")
+        response = ollama.chat(
+            model='phi3:mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            options={'temperature': 0.3, 'num_predict': 1000}
+        )
+        st.session_state.pensamento_agentes.append("LLM respondeu com sucesso")
+        return response['message']['content'].strip()
+    except Exception as e:
+        st.session_state.pensamento_agentes.append(f"Erro ao gerar conclusões: {e}")
+        
+        # Fallback: gerar conclusões baseadas apenas nos insights
+        conclusao_fallback = "Baseado nas análises realizadas:\n\n"
+        conclusao_fallback += "PRINCIPAIS DESCOBERTAS:\n"
+        for insight in insights_descobertos[-5:]:
+            conclusao_fallback += f"- {insight}\n"
+        conclusao_fallback += f"\nForam realizadas {len(analises_realizadas)} análises no total."
+        return conclusao_fallback
+
+# --- Interface Principal ---
+st.title("Sistema Multiagente - EDA Genérico")
+st.markdown("*Sistema inteligente para análise exploratória de qualquer dataset CSV*")
+
+# --- Sidebar ---
+with st.sidebar:
+    st.header("Configuração")
+    uploaded_file = st.file_uploader("Upload do arquivo CSV:", type=["csv"])
+    
+    if st.session_state.df is not None:
+        info = obter_info_completa_dataframe(st.session_state.df)
+        st.success("Dataset carregado!")
+        
+        with st.expander("Informações do Dataset", expanded=False):
+            st.metric("Linhas", info['shape'][0])
+            st.metric("Colunas", info['shape'][1])
+            st.metric("Memória (MB)", info['memoria_mb'])
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Numéricas:**")
+                st.write(info['colunas_numericas'][:3] + (['...'] if len(info['colunas_numericas']) > 3 else []))
+            with col2:
+                st.write("**Categóricas:**")  
+                st.write(info['colunas_categoricas'][:3] + (['...'] if len(info['colunas_categoricas']) > 3 else []))
+        
+        # Progresso das análises
+        if st.session_state.analises_realizadas:
+            st.write("### Análises Realizadas")
+            for i, analise in enumerate(st.session_state.analises_realizadas[-5:], 1):
+                st.write(f"{i}. {analise['tipo']}")
+        
+        # Insights descobertos
+        if st.session_state.insights_descobertos:
+            st.write("### Insights")
+            for insight in st.session_state.insights_descobertos[-3:]:
+                st.info(insight)
+
+# --- Área Principal ---
+if uploaded_file is None:
+    st.info("Faça o upload de um arquivo CSV para começar")
+    
+    st.write("### Exemplos de perguntas:")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Descrição dos Dados:**")
+        st.write("- Quais são os tipos de dados?")
+        st.write("- Mostre as estatísticas descritivas")
+        
+        st.write("**Detecção de Anomalias:**") 
+        st.write("- Existem valores atípicos?")
+        st.write("- Encontre outliers nos dados")
+    
+    with col2:
+        st.write("**Padrões e Tendências:**")
+        st.write("- Mostre a distribuição da variável X")
+        st.write("- Gere um histograma")
+        
+        st.write("**Relações e Conclusões:**")
+        st.write("- Como as variáveis se relacionam?")
+        st.write("- Quais suas conclusões sobre os dados?")
+
+else:
+    # Carregamento do arquivo
+    if st.session_state.df is None or st.session_state.get('file_name') != uploaded_file.name:
+        try:
+            st.session_state.df = pd.read_csv(uploaded_file)
+            st.session_state.file_name = uploaded_file.name
+            st.session_state.messages = [{"role": "assistant", "content": f"Dataset '{uploaded_file.name}' carregado com sucesso! O que gostaria de descobrir?"}]
+            st.session_state.analises_realizadas = []
+            st.session_state.insights_descobertos = []
+            st.session_state.pensamento_agentes = []
+        except Exception as e:
+            st.error(f"Erro ao carregar: {e}")
+            st.stop()
+    
+    df = st.session_state.df
+    info_df = obter_info_completa_dataframe(df)
+
+    # --- Exibir pensamento dos agentes ---
+    if st.session_state.pensamento_agentes:
+        with st.expander("Ver Pensamento dos Agentes", expanded=False):
+            for pensamento in st.session_state.pensamento_agentes[-10:]:
+                st.text(pensamento)
+
+    # --- Chat Interface ---
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    if prompt_usuario := st.chat_input("Faça sua pergunta sobre os dados..."):
+        st.session_state.messages.append({"role": "user", "content": prompt_usuario})
+        st.session_state.pensamento_agentes = []
+        
+        with st.chat_message("user"):
+            st.write(prompt_usuario)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Agentes analisando..."):
                 try:
-                    # Executar código
-                    exec(codigo_limpo, {
-                        "df": df,
-                        "plt": plt,
-                        "pd": pd,
-                        "np": np,
-                        "print": print
+                    # 1. Classificar pergunta
+                    tipo_pergunta = classificar_pergunta(prompt_usuario)
+                    
+                    # 2. Verificar se é pergunta sobre conclusões
+                    if tipo_pergunta == "conclusoes":
+                        st.write("### 📊 Gerando Conclusões Finais...")
+                        
+                        conclusoes = agente_conclusoes_completo(
+                            df,
+                            st.session_state.analises_realizadas, 
+                            st.session_state.insights_descobertos
+                        )
+                        
+                        st.markdown(conclusoes)
+                        st.session_state.messages.append({"role": "assistant", "content": conclusoes})
+                        st.rerun()
+                    
+                    # 3. Processar normalmente
+                    ferramenta_escolhida = agente_roteador_inteligente(
+                        prompt_usuario, 
+                        list(caixa_de_ferramentas.keys()), 
+                        info_df, 
+                        tipo_pergunta
+                    )
+                    
+                    parametros_extraidos = agente_extrator_parametros_melhorado(
+                        prompt_usuario, 
+                        ferramenta_escolhida, 
+                        info_df
+                    )
+                    
+                    # VERIFICAÇÃO: Se for boxplot, garantir que tem os parâmetros necessários
+                    if ferramenta_escolhida == "gerar_boxplot":
+                        if "coluna_x" not in parametros_extraidos or "coluna_y" not in parametros_extraidos:
+                            # Tentar extrair manualmente da pergunta
+                            palavras = prompt_usuario.lower().split()
+                            for col in info_df['colunas']:
+                                if col.lower() in palavras:
+                                    if col in info_df['colunas_categoricas'] and "coluna_x" not in parametros_extraidos:
+                                        parametros_extraidos["coluna_x"] = col
+                                    elif col in info_df['colunas_numericas'] and "coluna_y" not in parametros_extraidos:
+                                        parametros_extraidos["coluna_y"] = col
+                            
+                            # Se ainda não tem, usar defaults inteligentes
+                            if "coluna_x" not in parametros_extraidos and info_df['colunas_categoricas']:
+                                parametros_extraidos["coluna_x"] = info_df['colunas_categoricas'][0]
+                            if "coluna_y" not in parametros_extraidos and info_df['colunas_numericas']:
+                                # Procurar "amount" ou similar na pergunta
+                                for col in info_df['colunas_numericas']:
+                                    if 'amount' in col.lower() or 'valor' in col.lower():
+                                        parametros_extraidos["coluna_y"] = col
+                                        break
+                                if "coluna_y" not in parametros_extraidos:
+                                    parametros_extraidos["coluna_y"] = info_df['colunas_numericas'][0]
+                    
+                    # 4. Decidir se deve gerar gráfico
+                    deve_gerar_grafico = agente_deve_gerar_grafico(prompt_usuario, ferramenta_escolhida)
+                    
+                    # 5. Executar ferramenta
+                    funcao_da_ferramenta = caixa_de_ferramentas[ferramenta_escolhida]
+                    funcao_da_ferramenta(df=df, **parametros_extraidos)
+                    
+                    # 6. Extrair insights automáticos
+                    novos_insights = extrair_insights_do_resultado(ferramenta_escolhida, df, parametros_extraidos)
+                    st.session_state.insights_descobertos.extend(novos_insights)
+                    
+                    # 7. Registrar análise com insights
+                    st.session_state.analises_realizadas.append({
+                        "tipo": ferramenta_escolhida,
+                        "parametros": parametros_extraidos,
+                        "insights": novos_insights,
+                        "timestamp": datetime.now()
                     })
                     
-                    print("\n✅ Código executado com sucesso!")
+                    # 8. Gerar resposta textual inteligente usando LLM
+                    prompt_resposta = f"""Responda à pergunta do usuário de forma direta e clara baseado nas análises realizadas.
+
+PERGUNTA DO USUÁRIO: "{prompt_usuario}"
+
+ANÁLISE EXECUTADA: {ferramenta_escolhida}
+PARÂMETROS: {parametros_extraidos if parametros_extraidos else 'Nenhum'}
+
+DESCOBERTAS:
+{chr(10).join([f"- {insight}" for insight in novos_insights]) if novos_insights else 'Análise executada com sucesso'}
+
+Responda à pergunta de forma direta em 2-3 frases, mencionando os principais achados. Seja objetivo e em português do Brasil."""
+
+                    try:
+                        response = ollama.chat(
+                            model='phi3:mini',
+                            messages=[{'role': 'user', 'content': prompt_resposta}],
+                            options={'temperature': 0.3, 'num_predict': 200}
+                        )
+                        resposta = response['message']['content'].strip()
+                    except:
+                        # Fallback se LLM falhar
+                        resposta = f"Análise concluída usando **{ferramenta_escolhida}**"
+                        if novos_insights:
+                            resposta += "\n\n**Principais descobertas:**\n"
+                            for insight in novos_insights[:3]:
+                                resposta += f"- {insight}\n"
                     
-                    # Tentar extrair insight da explicação
-                    if len(explicacao) > 50:
-                        # Pega última frase como possível insight
-                        frases = explicacao.split('.')
-                        if len(frases) > 1:
-                            possivel_insight = frases[-2].strip()
-                            if len(possivel_insight) > 20:
-                                salvar_na_memoria("insight", possivel_insight)
-                    
+                    st.write(resposta)
+                    st.session_state.messages.append({"role": "assistant", "content": resposta})
+
                 except Exception as e:
-                    print(f"\n⚠️  Erro: {type(e).__name__}: {str(e)}")
-                    print("💡 A explicação acima ainda é válida!\n")
-        
-    except requests.exceptions.RequestException as e:
-        print(f"\n⚠️  Erro de conexão: {e}")
-        print("Verifique se Ollama está rodando: ollama serve\n")
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Interrompido.\n")
-        break
-    except Exception as e:
-        print(f"\n⚠️  Erro: {type(e).__name__}: {e}\n")
+                    error_msg = f"Erro: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                    st.session_state.pensamento_agentes.append(f"Erro na execução: {e}")
