@@ -1,7 +1,9 @@
 streamlit
 pandas
-requests
 numpy
-plotly
+scipy
 matplotlib
 seaborn
+plotly
+scikit-learn
+groq
